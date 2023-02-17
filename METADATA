@@ -11,13 +11,13 @@ third_party {
   }
   url {
     type: ARCHIVE
-    value: "https://static.crates.io/crates/pest_generator/pest_generator-2.5.4.crate"
+    value: "https://static.crates.io/crates/pest_generator/pest_generator-2.5.5.crate"
   }
-  version: "2.5.4"
+  version: "2.5.5"
   license_type: NOTICE
   last_upgrade_date {
     year: 2023
     month: 2
-    day: 3
+    day: 16
   }
 }
