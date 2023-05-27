@@ -27,7 +27,7 @@ use std::io::{self, Read};
 use std::path::Path;
 
 use proc_macro2::TokenStream;
-use syn::{Attribute, DeriveInput, Generics, Ident, Lit, Meta};
+use syn::{Attribute, DeriveInput, Expr, ExprLit, Generics, Ident, Lit, Meta};
 
 #[macro_use]
 mod macros;
@@ -45,7 +45,7 @@ pub fn derive_parser(input: TokenStream, include_grammar: bool) -> TokenStream {
     let (name, generics, contents) = parse_derive(ast);
 
     let mut data = String::new();
-    let mut path = None;
+    let mut paths = vec![];
 
     for content in contents {
         let (_data, _path) = match content {
@@ -81,8 +81,9 @@ pub fn derive_parser(input: TokenStream, include_grammar: bool) -> TokenStream {
         };
 
         data.push_str(&_data);
-        if _path.is_some() {
-            path = _path;
+        match _path {
+            Some(path) => paths.push(path),
+            None => (),
         }
     }
 
@@ -99,7 +100,7 @@ pub fn derive_parser(input: TokenStream, include_grammar: bool) -> TokenStream {
     generator::generate(
         name,
         &generics,
-        path,
+        paths,
         optimized,
         defaults,
         &doc_comment,
@@ -127,11 +128,9 @@ fn parse_derive(ast: DeriveInput) -> (Ident, Generics, Vec<GrammarSource>) {
     let grammar: Vec<&Attribute> = ast
         .attrs
         .iter()
-        .filter(|attr| match attr.parse_meta() {
-            Ok(Meta::NameValue(name_value)) => {
-                name_value.path.is_ident("grammar") || name_value.path.is_ident("grammar_inline")
-            }
-            _ => false,
+        .filter(|attr| {
+            let path = attr.meta.path();
+            path.is_ident("grammar") || path.is_ident("grammar_inline")
         })
         .collect();
 
@@ -148,9 +147,12 @@ fn parse_derive(ast: DeriveInput) -> (Ident, Generics, Vec<GrammarSource>) {
 }
 
 fn get_attribute(attr: &Attribute) -> GrammarSource {
-    match attr.parse_meta() {
-        Ok(Meta::NameValue(name_value)) => match name_value.lit {
-            Lit::Str(string) => {
+    match &attr.meta {
+        Meta::NameValue(name_value) => match &name_value.value {
+            Expr::Lit(ExprLit {
+                lit: Lit::Str(string),
+                ..
+            }) => {
                 if name_value.path.is_ident("grammar") {
                     GrammarSource::File(string.value())
                 } else {
