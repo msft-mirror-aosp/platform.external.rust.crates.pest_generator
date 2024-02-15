@@ -11,35 +11,32 @@ use std::path::PathBuf;
 
 use proc_macro2::TokenStream;
 use quote::{ToTokens, TokenStreamExt};
-use syn::{self, Generics, Ident};
+use syn::{self, Ident};
 
 use pest::unicode::unicode_property_names;
 use pest_meta::ast::*;
 use pest_meta::optimizer::*;
 
 use crate::docs::DocComment;
+use crate::ParsedDerive;
 
 pub(crate) fn generate(
-    name: Ident,
-    generics: &Generics,
-    path: Option<PathBuf>,
+    parsed_derive: ParsedDerive,
+    paths: Vec<PathBuf>,
     rules: Vec<OptimizedRule>,
     defaults: Vec<&str>,
     doc_comment: &DocComment,
     include_grammar: bool,
 ) -> TokenStream {
     let uses_eoi = defaults.iter().any(|name| *name == "EOI");
-
+    let name = parsed_derive.name;
     let builtins = generate_builtin_rules();
     let include_fix = if include_grammar {
-        match path {
-            Some(ref path) => generate_include(&name, path.to_str().expect("non-Unicode path")),
-            None => quote!(),
-        }
+        generate_include(&name, paths)
     } else {
         quote!()
     };
-    let rule_enum = generate_enum(&rules, doc_comment, uses_eoi);
+    let rule_enum = generate_enum(&rules, doc_comment, uses_eoi, parsed_derive.non_exhaustive);
     let patterns = generate_patterns(&rules, uses_eoi);
     let skip = generate_skip(&rules);
 
@@ -52,7 +49,7 @@ pub(crate) fn generate(
         }
     }));
 
-    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+    let (impl_generics, ty_generics, where_clause) = parsed_derive.generics.split_for_impl();
 
     let result = result_type();
 
@@ -170,22 +167,43 @@ fn generate_builtin_rules() -> Vec<(&'static str, TokenStream)> {
     builtins
 }
 
-// Needed because Cargo doesn't watch for changes in grammars.
-fn generate_include(name: &Ident, path: &str) -> TokenStream {
+/// Generate Rust `include_str!` for grammar files, then Cargo will watch changes in grammars.
+fn generate_include(name: &Ident, paths: Vec<PathBuf>) -> TokenStream {
     let const_name = format_ident!("_PEST_GRAMMAR_{}", name);
     // Need to make this relative to the current directory since the path to the file
     // is derived from the CARGO_MANIFEST_DIR environment variable
-    let mut current_dir = std::env::current_dir().expect("Unable to get current directory");
-    current_dir.push(path);
-    let relative_path = current_dir.to_str().expect("path contains invalid unicode");
+    let current_dir = std::env::current_dir().expect("Unable to get current directory");
+
+    let include_tokens = paths.iter().map(|path| {
+        let path = path.to_str().expect("non-Unicode path");
+
+        let relative_path = current_dir
+            .join(path)
+            .to_str()
+            .expect("path contains invalid unicode")
+            .to_string();
+
+        quote! {
+            include_str!(#relative_path)
+        }
+    });
+
+    let len = include_tokens.len();
     quote! {
         #[allow(non_upper_case_globals)]
-        const #const_name: &'static str = include_str!(#relative_path);
+        const #const_name: [&'static str; #len] = [
+            #(#include_tokens),*
+        ];
     }
 }
 
-fn generate_enum(rules: &[OptimizedRule], doc_comment: &DocComment, uses_eoi: bool) -> TokenStream {
-    let rules = rules.iter().map(|rule| {
+fn generate_enum(
+    rules: &[OptimizedRule],
+    doc_comment: &DocComment,
+    uses_eoi: bool,
+    non_exhaustive: bool,
+) -> TokenStream {
+    let rule_variants = rules.iter().map(|rule| {
         let rule_name = format_ident!("r#{}", rule.name);
 
         match doc_comment.line_docs.get(&rule.name) {
@@ -200,26 +218,49 @@ fn generate_enum(rules: &[OptimizedRule], doc_comment: &DocComment, uses_eoi: bo
     });
 
     let grammar_doc = &doc_comment.grammar_doc;
-    if uses_eoi {
-        quote! {
-            #[doc = #grammar_doc]
-            #[allow(dead_code, non_camel_case_types, clippy::upper_case_acronyms)]
-            #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-            pub enum Rule {
-                EOI,
-                #( #rules ),*
-            }
-        }
-    } else {
-        quote! {
-            #[doc = #grammar_doc]
-            #[allow(dead_code, non_camel_case_types, clippy::upper_case_acronyms)]
-            #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-            pub enum Rule {
-                #( #rules ),*
-            }
-        }
+    let mut result = quote! {
+        #[doc = #grammar_doc]
+        #[allow(dead_code, non_camel_case_types, clippy::upper_case_acronyms)]
+        #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+    };
+    if non_exhaustive {
+        result.append_all(quote! {
+            #[non_exhaustive]
+        });
     }
+    result.append_all(quote! {
+        pub enum Rule
+    });
+    if uses_eoi {
+        result.append_all(quote! {
+            {
+                #[doc = "End-of-input"]
+                EOI,
+                #( #rule_variants ),*
+            }
+        });
+    } else {
+        result.append_all(quote! {
+            {
+                #( #rule_variants ),*
+            }
+        })
+    };
+
+    let rules = rules.iter().map(|rule| {
+        let rule_name = format_ident!("r#{}", rule.name);
+        quote! { #rule_name }
+    });
+
+    result.append_all(quote! {
+        impl Rule {
+            pub fn all_rules() -> &'static[Rule] {
+                &[ #(Rule::#rules), * ]
+            }
+        }
+    });
+
+    result
 }
 
 fn generate_patterns(rules: &[OptimizedRule], uses_eoi: bool) -> TokenStream {
@@ -483,6 +524,26 @@ fn generate_expr(expr: OptimizedExpr) -> TokenStream {
                 })
             }
         }
+        #[cfg(feature = "grammar-extras")]
+        OptimizedExpr::RepOnce(expr) => {
+            let expr = generate_expr(*expr);
+
+            quote! {
+                state.sequence(|state| {
+                    #expr.and_then(|state| {
+                        state.repeat(|state| {
+                            state.sequence(|state| {
+                                super::hidden::skip(
+                                    state
+                                ).and_then(|state| {
+                                    #expr
+                                })
+                            })
+                        })
+                    })
+                })
+            }
+        }
         OptimizedExpr::Skip(strings) => {
             quote! {
                 let strings = [#(#strings),*];
@@ -502,6 +563,13 @@ fn generate_expr(expr: OptimizedExpr) -> TokenStream {
 
             quote! {
                 state.restore_on_err(|state| #expr)
+            }
+        }
+        #[cfg(feature = "grammar-extras")]
+        OptimizedExpr::NodeTag(expr, tag) => {
+            let expr = generate_expr(*expr);
+            quote! {
+                #expr.and_then(|state| state.tag_node(#tag))
             }
         }
     }
@@ -615,6 +683,22 @@ fn generate_expr_atomic(expr: OptimizedExpr) -> TokenStream {
                 })
             }
         }
+        #[cfg(feature = "grammar-extras")]
+        OptimizedExpr::RepOnce(expr) => {
+            let expr = generate_expr_atomic(*expr);
+
+            quote! {
+                state.sequence(|state| {
+                    #expr.and_then(|state| {
+                        state.repeat(|state| {
+                            state.sequence(|state| {
+                                #expr
+                            })
+                        })
+                    })
+                })
+            }
+        }
         OptimizedExpr::Skip(strings) => {
             quote! {
                 let strings = [#(#strings),*];
@@ -634,6 +718,13 @@ fn generate_expr_atomic(expr: OptimizedExpr) -> TokenStream {
 
             quote! {
                 state.restore_on_err(|state| #expr)
+            }
+        }
+        #[cfg(feature = "grammar-extras")]
+        OptimizedExpr::NodeTag(expr, tag) => {
+            let expr = generate_expr_atomic(*expr);
+            quote! {
+                #expr.and_then(|state| state.tag_node(#tag))
             }
         }
     }
@@ -681,6 +772,7 @@ mod tests {
 
     use proc_macro2::Span;
     use std::collections::HashMap;
+    use syn::Generics;
 
     #[test]
     fn rule_enum_simple() {
@@ -699,7 +791,7 @@ mod tests {
         };
 
         assert_eq!(
-            generate_enum(&rules, doc_comment, false).to_string(),
+            generate_enum(&rules, doc_comment, false, false).to_string(),
             quote! {
                 #[doc = "Rule doc\nhello"]
                 #[allow(dead_code, non_camel_case_types, clippy::upper_case_acronyms)]
@@ -707,6 +799,11 @@ mod tests {
                 pub enum Rule {
                     #[doc = "This is rule comment"]
                     r#f
+                }
+                impl Rule {
+                    pub fn all_rules() -> &'static [Rule] {
+                        &[Rule::r#f]
+                    }
                 }
             }
             .to_string()
@@ -1016,14 +1113,20 @@ mod tests {
         let defaults = vec!["ANY"];
         let result = result_type();
         let box_ty = box_type();
-        let mut current_dir = std::env::current_dir().expect("Unable to get current directory");
-        current_dir.push("test.pest");
-        let test_path = current_dir.to_str().expect("path contains invalid unicode");
+        let current_dir = std::env::current_dir().expect("Unable to get current directory");
+
+        let base_path = current_dir.join("base.pest").to_str().unwrap().to_string();
+        let test_path = current_dir.join("test.pest").to_str().unwrap().to_string();
+        let parsed_derive = ParsedDerive {
+            name,
+            generics,
+            non_exhaustive: false,
+        };
         assert_eq!(
-            generate(name, &generics, Some(PathBuf::from("test.pest")), rules, defaults, doc_comment, true).to_string(),
+            generate(parsed_derive, vec![PathBuf::from("base.pest"), PathBuf::from("test.pest")], rules, defaults, doc_comment, true).to_string(),
             quote! {
                 #[allow(non_upper_case_globals)]
-                const _PEST_GRAMMAR_MyParser: &'static str = include_str!(#test_path);
+                const _PEST_GRAMMAR_MyParser: [&'static str; 2usize] = [include_str!(#base_path), include_str!(#test_path)];
 
                 #[doc = "This is Rule doc\nThis is second line"]
                 #[allow(dead_code, non_camel_case_types, clippy::upper_case_acronyms)]
@@ -1032,6 +1135,11 @@ mod tests {
                     r#a,
                     #[doc = "If statement"]
                     r#if
+                }
+                impl Rule {
+                    pub fn all_rules() -> &'static [Rule] {
+                        &[Rule::r#a, Rule::r#if]
+                    }
                 }
 
                 #[allow(clippy::all)]
