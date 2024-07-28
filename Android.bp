@@ -43,6 +43,7 @@ license {
 
 rust_library_host {
     name: "libpest_generator",
+    host_cross_supported: false,
     crate_name: "pest_generator",
     cargo_env_compat: true,
     cargo_pkg_version: "2.7.6",
